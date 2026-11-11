@@ -1,0 +1,17 @@
+[Unit]
+Description=TouchKio C4001 mmWave presence sensor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+SupplementaryGroups=gpio
+WorkingDirectory=/opt/touchkio-mmwave-sensor
+ExecStart=/opt/touchkio-mmwave-sensor/venv/bin/python /opt/touchkio-mmwave-sensor/mmwave.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
