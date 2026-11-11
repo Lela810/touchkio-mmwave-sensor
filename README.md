@@ -38,11 +38,11 @@ touchkio-mmwave-update
 
 It asks for `sudo` if needed and keeps the user the service already runs as.
 
-## Detailed tracking (optional)
+## Detailed tracking
 
-The C4001 can also report the distance, speed and signal energy of the detected
-target over its serial (UART) interface. When enabled, the service publishes
-these extra entities on the TouchKio device in Home Assistant:
+The C4001 also reports the distance, speed and signal energy of the detected
+target over its serial (UART) interface. The service publishes these extra
+entities on the TouchKio device in Home Assistant:
 
 | Entity | Unit | Description |
 | --- | --- | --- |
@@ -51,7 +51,8 @@ these extra entities on the TouchKio device in Home Assistant:
 | C4001 Target Speed | m/s | Speed of the target |
 | C4001 Target Energy | | Signal strength of the target |
 
-Distance, speed and energy are `unknown` while no target is detected.
+Distance, speed and energy are `unknown` while no target is detected. The
+entities show as unavailable while the serial port cannot be read.
 
 Tracking switches the C4001 to its speed and distance mode, which detects
 motion and micro-motion instead of using its dedicated presence algorithm.
@@ -59,35 +60,35 @@ While tracking is on, the presence entity turns on when either the OUT pin is
 high or a target is tracked. When the service stops, it switches the sensor
 back to presence detection mode.
 
-1. Wire the sensor's UART to the Raspberry Pi in addition to the OUT pin. On
-   Gravity boards, set the communication switch to UART.
+Wire the sensor's UART to the Raspberry Pi in addition to the OUT pin. On
+Gravity boards, set the communication switch to UART.
 
-   | C4001 | Raspberry Pi |
-   | --- | --- |
-   | TX | GPIO 15 / RXD (pin 10) |
-   | RX | GPIO 14 / TXD (pin 8) |
+| C4001 | Raspberry Pi | Physical pin |
+| --- | --- | --- |
+| VIN | 5V | 2 |
+| GND | GND | 6 |
+| OUT | GPIO 17 | 11 |
+| TX | GPIO 15 / RXD | 10 |
+| RX | GPIO 14 / TXD | 8 |
 
-2. Enable the serial port and disable the serial login console, then reboot:
+The installer enables the serial port on GPIO 14/15: on a Raspberry Pi 5 it
+adds `dtparam=uart0=on` to `/boot/firmware/config.txt`, on other models it
+enables the UART and disables the serial login console with `raspi-config`.
+Reboot when the installer asks you to.
 
-   ```sh
-   sudo raspi-config nonint do_serial_cons 1
-   sudo raspi-config nonint do_serial_hw 0
-   sudo reboot
-   ```
+Settings live in `/etc/default/touchkio-mmwave`:
 
-3. Set `C4001_TRACKING=1` in `/etc/default/touchkio-mmwave` and restart the
-   service:
+| Setting | Default | Description |
+| --- | --- | --- |
+| `C4001_TRACKING` | `1` | Set to `0` to only publish the OUT pin |
+| `C4001_SERIAL_PORT` | `auto` | `/dev/ttyAMA0` on a Raspberry Pi 5, `/dev/serial0` otherwise |
+| `C4001_SERIAL_BAUD` | `9600` | Serial baud rate |
+| `C4001_TRACKING_INTERVAL` | `0.5` | Minimum seconds between MQTT updates |
 
-   ```sh
-   sudo sed -i 's/^C4001_TRACKING=.*/C4001_TRACKING=1/' /etc/default/touchkio-mmwave
-   sudo systemctl restart touchkio-mmwave
-   ```
-
-The same file sets the serial port (`C4001_SERIAL_PORT`, default
-`/dev/serial0`), baud rate (`C4001_SERIAL_BAUD`, default `9600`) and the
-minimum time between MQTT updates (`C4001_TRACKING_INTERVAL`, default `0.5`
-seconds). Updates keep your settings. Set `C4001_TRACKING=0` to turn tracking
-off again; its entities are removed from Home Assistant on the next start.
+Restart the service after changing them with
+`sudo systemctl restart touchkio-mmwave`. Updates keep your settings. When
+tracking is turned off, its entities are removed from Home Assistant on the
+next start.
 
 Check service status and logs with:
 

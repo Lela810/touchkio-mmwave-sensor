@@ -59,11 +59,32 @@ SENSOR_NAME = "C4001 Presence"
 SENSOR_PATH = "c4001_presence"
 
 # Detailed tracking reads distance, speed and energy over UART. It switches
-# the C4001 into speed and distance mode, so it is opt-in.
-TRACKING_ENABLED = os.environ.get("C4001_TRACKING", "0").strip().lower() in (
+# the C4001 into speed and distance mode; set C4001_TRACKING=0 to keep the
+# sensor in presence mode and only publish the OUT pin.
+TRACKING_ENABLED = os.environ.get("C4001_TRACKING", "1").strip().lower() in (
     "1", "true", "yes", "on"
 )
-SERIAL_PORT = os.environ.get("C4001_SERIAL_PORT", "/dev/serial0")
+
+
+def default_serial_port():
+
+    # GPIO 14/15 are /dev/ttyAMA0 on a Raspberry Pi 5; /dev/serial0 points to
+    # the separate debug UART connector there.
+    try:
+        with open("/proc/device-tree/model", "rb") as model_file:
+            model = model_file.read().decode(errors="ignore")
+    except OSError:
+        model = ""
+
+    if "Raspberry Pi 5" in model or "Compute Module 5" in model:
+        return "/dev/ttyAMA0"
+
+    return "/dev/serial0"
+
+
+SERIAL_PORT = os.environ.get("C4001_SERIAL_PORT", "auto").strip()
+if not SERIAL_PORT or SERIAL_PORT == "auto":
+    SERIAL_PORT = default_serial_port()
 SERIAL_BAUD = int(os.environ.get("C4001_SERIAL_BAUD", "9600"))
 TRACKING_INTERVAL = float(os.environ.get("C4001_TRACKING_INTERVAL", "0.5"))
 

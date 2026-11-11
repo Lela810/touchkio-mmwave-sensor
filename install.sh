@@ -93,17 +93,47 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 
 # Publish detailed tracking data (target count, distance, speed, energy)
 # read from the C4001 over UART. Switches the sensor to speed and distance
-# mode while the service runs. Set to 1 to enable.
-C4001_TRACKING=0
+# mode while the service runs. Set to 0 to only publish the OUT pin.
+C4001_TRACKING=1
 
-# Serial port connected to the C4001 TX/RX pins.
-C4001_SERIAL_PORT=/dev/serial0
+# Serial port connected to the C4001 TX/RX pins. "auto" uses /dev/ttyAMA0
+# on a Raspberry Pi 5 and /dev/serial0 on other models.
+C4001_SERIAL_PORT=auto
 C4001_SERIAL_BAUD=9600
 
 # Minimum seconds between tracking updates sent to MQTT.
 C4001_TRACKING_INTERVAL=0.5
 EOF
     chmod 0644 "$CONFIG_FILE"
+elif grep -q '^# mode while the service runs. Set to 1 to enable.$' "$CONFIG_FILE"; then
+    # Move settings written by older installers to the new defaults unless
+    # they were changed.
+    sed -i \
+        -e 's/^# mode while the service runs. Set to 1 to enable.$/# mode while the service runs. Set to 0 to only publish the OUT pin./' \
+        -e 's/^C4001_TRACKING=0$/C4001_TRACKING=1/' \
+        -e 's|^# Serial port connected to the C4001 TX/RX pins.$|# Serial port connected to the C4001 TX/RX pins. "auto" uses /dev/ttyAMA0\n# on a Raspberry Pi 5 and /dev/serial0 on other models.|' \
+        -e 's|^C4001_SERIAL_PORT=/dev/serial0$|C4001_SERIAL_PORT=auto|' \
+        "$CONFIG_FILE"
+fi
+
+# Enable the UART on GPIO 14/15 when tracking is on.
+REBOOT_REQUIRED=0
+if grep -Eq '^C4001_TRACKING=(1|true|yes|on)$' "$CONFIG_FILE"; then
+    BOOT_CONFIG=/boot/firmware/config.txt
+    [[ -f "$BOOT_CONFIG" ]] || BOOT_CONFIG=/boot/config.txt
+    MODEL=$(tr -d '\0' </proc/device-tree/model 2>/dev/null || true)
+    if [[ "$MODEL" == *"Raspberry Pi 5"* || "$MODEL" == *"Compute Module 5"* ]]; then
+        if [[ -f "$BOOT_CONFIG" ]] && ! grep -q '^dtparam=uart0=on' "$BOOT_CONFIG"; then
+            echo 'dtparam=uart0=on' >>"$BOOT_CONFIG"
+            REBOOT_REQUIRED=1
+        fi
+    elif command -v raspi-config >/dev/null 2>&1; then
+        if [[ -f "$BOOT_CONFIG" ]] && ! grep -q '^enable_uart=1' "$BOOT_CONFIG"; then
+            REBOOT_REQUIRED=1
+        fi
+        raspi-config nonint do_serial_cons 1
+        raspi-config nonint do_serial_hw 0
+    fi
 fi
 
 cat >"$UPDATE_COMMAND" <<EOF
@@ -127,4 +157,10 @@ chmod 0755 "$UPDATE_COMMAND"
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME.service"
 systemctl restart "$SERVICE_NAME.service"
-systemctl --no-pager --full status "$SERVICE_NAME.service"
+systemctl --no-pager --full status "$SERVICE_NAME.service" || true
+
+if [[ $REBOOT_REQUIRED -eq 1 ]]; then
+    echo
+    echo "The serial port for detailed tracking was enabled. Reboot to apply it:"
+    echo "  sudo reboot"
+fi
