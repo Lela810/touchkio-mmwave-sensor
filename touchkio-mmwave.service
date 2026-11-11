@@ -6,13 +6,8 @@ After=network-online.target
 [Service]
 Type=simple
 User=@SERVICE_USER@
-SupplementaryGroups=gpio dialout
-EnvironmentFile=-/etc/default/touchkio-mmwave
-# lgpio creates notification pipes in its working directory, which must be
-# writable by the service user; /opt/touchkio-mmwave-sensor is owned by root.
-RuntimeDirectory=touchkio-mmwave
-WorkingDirectory=/run/touchkio-mmwave
-Environment=LG_WD=/run/touchkio-mmwave
+SupplementaryGroups=gpio
+WorkingDirectory=/opt/touchkio-mmwave-sensor
 ExecStart=/opt/touchkio-mmwave-sensor/venv/bin/python /opt/touchkio-mmwave-sensor/mmwave.py
 Restart=on-failure
 RestartSec=5

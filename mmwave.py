@@ -7,12 +7,10 @@ import hashlib
 import json
 import logging
 import os
-import re
 import shutil
 import signal
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -57,68 +55,6 @@ GPIO_PIN = 17
 
 SENSOR_NAME = "C4001 Presence"
 SENSOR_PATH = "c4001_presence"
-
-# Detailed tracking reads distance, speed and energy over UART. It switches
-# the C4001 into speed and distance mode; set C4001_TRACKING=0 to keep the
-# sensor in presence mode and only publish the OUT pin.
-TRACKING_ENABLED = os.environ.get("C4001_TRACKING", "1").strip().lower() in (
-    "1", "true", "yes", "on"
-)
-
-
-def default_serial_port():
-
-    # GPIO 14/15 are /dev/ttyAMA0 on a Raspberry Pi 5; /dev/serial0 points to
-    # the separate debug UART connector there.
-    try:
-        with open("/proc/device-tree/model", "rb") as model_file:
-            model = model_file.read().decode(errors="ignore")
-    except OSError:
-        model = ""
-
-    if "Raspberry Pi 5" in model or "Compute Module 5" in model:
-        return "/dev/ttyAMA0"
-
-    return "/dev/serial0"
-
-
-SERIAL_PORT = os.environ.get("C4001_SERIAL_PORT", "auto").strip()
-if not SERIAL_PORT or SERIAL_PORT == "auto":
-    SERIAL_PORT = default_serial_port()
-SERIAL_BAUD = int(os.environ.get("C4001_SERIAL_BAUD", "9600"))
-TRACKING_INTERVAL = float(os.environ.get("C4001_TRACKING_INTERVAL", "0.5"))
-
-TRACKING_PATH = "c4001_tracking"
-
-# The sensor reports empty frames between detections; hold the last target
-# briefly so the values do not flicker.
-TARGET_LOST_TIMEOUT = 1.0
-
-# Reconfigure the sensor if no tracking frames arrive for this long.
-TRACKING_STALE_TIMEOUT = 10.0
-
-TRACKING_SENSORS = (
-    ("target_count", "C4001 Targets", {
-        "state_class": "measurement",
-        "icon": "mdi:account-search"
-    }),
-    ("distance", "C4001 Target Distance", {
-        "unit_of_measurement": "m",
-        "device_class": "distance",
-        "state_class": "measurement",
-        "suggested_display_precision": 2
-    }),
-    ("speed", "C4001 Target Speed", {
-        "unit_of_measurement": "m/s",
-        "device_class": "speed",
-        "state_class": "measurement",
-        "suggested_display_precision": 2
-    }),
-    ("energy", "C4001 Target Energy", {
-        "state_class": "measurement",
-        "icon": "mdi:signal"
-    }),
-)
 
 # Legacy discovery topic from the previous script.
 LEGACY_DISCOVERY_TOPIC = (
@@ -281,20 +217,19 @@ DISCOVERY_TOPIC = (
     f"{DEVICE_ID}/{SENSOR_PATH}/config"
 )
 
-TRACKING_STATE_TOPIC = f"{ROOT_TOPIC}/{TRACKING_PATH}/state"
-TRACKING_AVAILABILITY_TOPIC = f"{ROOT_TOPIC}/{TRACKING_PATH}/availability"
+# Retained topics from the removed detailed tracking feature.
+LEGACY_TRACKING_TOPICS = [
+    f"{DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/c4001_tracking_{key}/config"
+    for key in ("target_count", "distance", "speed", "energy")
+] + [
+    f"{ROOT_TOPIC}/c4001_tracking/state",
+    f"{ROOT_TOPIC}/c4001_tracking/availability"
+]
 
 logging.info("TouchKio application: %s", APP_NAME)
 logging.info("TouchKio device ID: %s", DEVICE_ID)
 logging.info("MQTT broker: %s", settings["mqtt_url"])
 logging.info("MQTT discovery: %s", DISCOVERY_PREFIX)
-logging.info(
-    "Detailed tracking: %s",
-    f"enabled on {SERIAL_PORT}" if TRACKING_ENABLED else "disabled"
-)
-
-if TRACKING_ENABLED:
-    import serial
 
 
 # =========================================================
@@ -410,391 +345,36 @@ def publish_discovery():
     return result
 
 
-def tracking_discovery_topic(key):
-
-    return (
-        f"{DISCOVERY_PREFIX}/sensor/"
-        f"{DEVICE_ID}/{TRACKING_PATH}_{key}/config"
-    )
-
-
-def publish_tracking_discovery():
-
-    for key, name, extra in TRACKING_SENSORS:
-
-        topic = tracking_discovery_topic(key)
-
-        if not TRACKING_ENABLED:
-            # Remove entities left over from a previous tracking setup.
-            client.publish(topic, payload=b"", qos=1, retain=True)
-            continue
-
-        config = {
-            "name": name,
-            "unique_id": f"{DEVICE_ID}_{TRACKING_PATH}_{key}",
-            "state_topic": TRACKING_STATE_TOPIC,
-            "value_template": f"{{{{ value_json.{key} }}}}",
-
-            # Unavailable when either the service or the UART link is down.
-            "availability": [
-                {"topic": AVAILABILITY_TOPIC},
-                {"topic": TRACKING_AVAILABILITY_TOPIC}
-            ],
-            "availability_mode": "all",
-            "payload_available": "online",
-            "payload_not_available": "offline",
-
-            "device": {
-                "identifiers": [DEVICE_ID]
-            },
-
-            **extra
-        }
-
-        client.publish(topic, json.dumps(config), qos=1, retain=True)
-
-    if TRACKING_ENABLED:
-        logging.info("MQTT tracking discovery published")
-
-
-# =========================================================
-# DETAILED TRACKING (UART)
-# =========================================================
-
-TRACKING_FRAME = re.compile(rb"\$DFDMD,([^$*]*)\*")
-PRESENCE_FRAME = re.compile(rb"\$DFHPD,")
-
-SPEED_MODE = 1
-PRESENCE_MODE = 0
-
-
-class C4001Tracking:
-
-    def __init__(self):
-
-        self.serial = None
-        self.thread = None
-        self.stop_event = threading.Event()
-        self.lock = threading.Lock()
-
-        self.target = None
-        self.target_seen_at = 0.0
-        self.frame_at = 0.0
-        self.online = False
-
-        self.published_payload = None
-        self.published_at = 0.0
-
-    @property
-    def target_present(self):
-
-        with self.lock:
-            return self.target is not None
-
-    def start(self):
-
-        self.thread = threading.Thread(
-            target=self._run,
-            name="c4001-tracking",
-            daemon=True
-        )
-        self.thread.start()
-
-    def stop(self):
-
-        self.stop_event.set()
-
-        if self.thread:
-            self.thread.join(timeout=5)
-
-        if self.serial and self.serial.is_open:
-            try:
-                # Return to presence mode so the OUT pin behaves as it does
-                # without tracking.
-                self._set_mode(PRESENCE_MODE)
-                logging.info("C4001 restored to presence detection mode")
-            except (serial.SerialException, OSError) as error:
-                logging.warning("Cannot restore C4001 presence mode: %s", error)
-
-        self._close()
-        self._set_online(False)
-
-    def republish(self):
-
-        # Called after an MQTT reconnect.
-        self.published_payload = None
-        self._publish_availability()
-
-    # -----------------------------------------------------
-
-    def _run(self):
-
-        while not self.stop_event.is_set():
-            try:
-                self._session()
-            except (serial.SerialException, OSError) as error:
-                logging.warning("C4001 UART error: %s", error)
-                self._close()
-                self._set_online(False)
-                self._clear_target()
-                self.stop_event.wait(5)
-
-    def _session(self):
-
-        if not self.serial or not self.serial.is_open:
-            self.serial = serial.Serial(
-                SERIAL_PORT,
-                SERIAL_BAUD,
-                timeout=0.5
-            )
-            logging.info(
-                "C4001 UART opened: %s at %s baud",
-                SERIAL_PORT,
-                SERIAL_BAUD
-            )
-
-        buffer = b""
-        mode_checked_at = time.monotonic()
-        configured = False
-
-        while not self.stop_event.is_set():
-
-            chunk = self.serial.read(256)
-            now = time.monotonic()
-
-            if chunk:
-                buffer += chunk
-
-                for match in TRACKING_FRAME.finditer(buffer):
-                    self._handle_frame(match.group(1), now)
-
-                if not configured and PRESENCE_FRAME.search(buffer):
-                    logging.info("C4001 is in presence mode; switching to speed mode")
-                    self._set_mode(SPEED_MODE)
-                    configured = True
-                    mode_checked_at = time.monotonic()
-                    buffer = b""
-                    continue
-
-                end = buffer.rfind(b"*")
-                if end != -1:
-                    buffer = buffer[end + 1:]
-                buffer = buffer[-512:]
-
-            last_activity = max(self.frame_at, mode_checked_at)
-            stale_after = TRACKING_STALE_TIMEOUT if configured else 3.0
-
-            if now - last_activity > stale_after:
-                if configured:
-                    logging.warning(
-                        "No C4001 tracking data for %.0fs; reconfiguring",
-                        now - last_activity
-                    )
-                    self._set_online(False)
-                else:
-                    logging.info("Switching C4001 to speed and distance mode")
-                self._set_mode(SPEED_MODE)
-                configured = True
-                mode_checked_at = time.monotonic()
-                buffer = b""
-                continue
-
-            self._expire_target(now)
-            self._publish(now)
-
-    def _handle_frame(self, raw, now):
-
-        fields = raw.decode("ascii", errors="ignore").split(",")
-
-        self.frame_at = now
-        self._set_online(True)
-
-        try:
-            count = int(fields[0].strip() or 0)
-        except ValueError:
-            return
-
-        if count < 1 or len(fields) < 5:
-            return
-
-        try:
-            target = {
-                "distance": float(fields[2]),
-                "speed": float(fields[3]),
-                "energy": int(float(fields[4]))
-            }
-        except ValueError:
-            return
-
-        with self.lock:
-            appeared = self.target is None
-            self.target = target
-            self.target_seen_at = now
-
-        if appeared:
-            publish_presence()
-
-    def _expire_target(self, now):
-
-        with self.lock:
-            expired = (
-                self.target is not None
-                and now - self.target_seen_at > TARGET_LOST_TIMEOUT
-            )
-            if expired:
-                self.target = None
-
-        if expired:
-            publish_presence()
-
-    def _clear_target(self):
-
-        with self.lock:
-            had_target = self.target is not None
-            self.target = None
-
-        if had_target:
-            publish_presence()
-
-    def _publish(self, now):
-
-        with self.lock:
-            target = self.target
-
-        payload = json.dumps({
-            "target_count": 1 if target else 0,
-            "distance": round(target["distance"], 2) if target else None,
-            "speed": round(target["speed"], 2) if target else None,
-            "energy": target["energy"] if target else None
-        }, sort_keys=True)
-
-        if payload == self.published_payload:
-            return
-
-        if (
-            self.published_payload is not None
-            and now - self.published_at < TRACKING_INTERVAL
-        ):
-            return
-
-        if not client.is_connected():
-            return
-
-        result = client.publish(
-            TRACKING_STATE_TOPIC,
-            payload=payload,
-            qos=0,
-            retain=True
-        )
-
-        if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            self.published_payload = payload
-            self.published_at = now
-
-    def _set_online(self, online):
-
-        if online == self.online:
-            return
-
-        self.online = online
-        logging.info(
-            "C4001 tracking %s",
-            "online" if online else "offline"
-        )
-        self._publish_availability()
-
-    def _publish_availability(self):
-
-        if client.is_connected():
-            client.publish(
-                TRACKING_AVAILABILITY_TOPIC,
-                payload="online" if self.online else "offline",
-                qos=1,
-                retain=True
-            )
-
-    def _send(self, command, delay):
-
-        self.serial.write(f"{command}\r\n".encode("ascii"))
-        self.serial.flush()
-        time.sleep(delay)
-
-    def _stop_sensor(self):
-
-        # The sensor can miss the command while it is streaming, so retry
-        # until it acknowledges.
-        for _ in range(5):
-            self.serial.reset_input_buffer()
-            self._send("sensorStop", 1.0)
-            response = self.serial.read(self.serial.in_waiting or 1)
-            if b"Done" in response or b"sensorStop" in response:
-                return
-        logging.warning("C4001 did not acknowledge sensorStop")
-
-    def _set_mode(self, mode):
-
-        self._stop_sensor()
-        self._send(f"setRunApp {mode}", 1.0)
-
-        if mode == SPEED_MODE:
-            # Detect small movements such as a person sitting still.
-            self._send("setMicroMotion 1", 0.2)
-
-        self._send("saveConfig", 0.5)
-        self._send("sensorStart", 0.5)
-        self.serial.reset_input_buffer()
-
-    def _close(self):
-
-        if self.serial:
-            try:
-                self.serial.close()
-            except (serial.SerialException, OSError):
-                pass
-            self.serial = None
-
-
-tracking = C4001Tracking() if TRACKING_ENABLED else None
-
-
 # =========================================================
 # PRESENCE STATE
 # =========================================================
 
 last_state = None
-presence_lock = threading.Lock()
 
 
 def publish_presence(force=False):
 
     global last_state
 
-    # In speed and distance mode the OUT pin may not report stationary
-    # presence, so a tracked target also counts as presence.
-    detected = sensor.is_pressed or (
-        tracking is not None and tracking.target_present
+    state = "ON" if sensor.is_pressed else "OFF"
+
+    if state == last_state and not force:
+        return
+
+    if not client.is_connected():
+        logging.warning("MQTT unavailable; state will be refreshed on reconnect")
+        return
+
+    result = client.publish(
+        STATE_TOPIC,
+        payload=state,
+        qos=1,
+        retain=True
     )
-    state = "ON" if detected else "OFF"
 
-    with presence_lock:
-
-        if state == last_state and not force:
-            return
-
-        if not client.is_connected():
-            logging.warning("MQTT unavailable; state will be refreshed on reconnect")
-            return
-
-        result = client.publish(
-            STATE_TOPIC,
-            payload=state,
-            qos=1,
-            retain=True
-        )
-
-        if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            last_state = state
-            logging.info("C4001 presence: %s", state)
+    if result.rc == mqtt.MQTT_ERR_SUCCESS:
+        last_state = state
+        logging.info("C4001 presence: %s", state)
 
 
 # =========================================================
@@ -839,9 +419,11 @@ def on_connect(client, userdata, flags, rc):
         retain=True
     )
 
+    for topic in LEGACY_TRACKING_TOPICS:
+        client.publish(topic, payload=b"", qos=1, retain=True)
+
     # Register the sensor under the existing TouchKio device.
     publish_discovery()
-    publish_tracking_discovery()
 
     # Set sensor availability.
     client.publish(
@@ -850,9 +432,6 @@ def on_connect(client, userdata, flags, rc):
         qos=1,
         retain=True
     )
-
-    if tracking is not None:
-        tracking.republish()
 
     # Publish current state after every reconnect.
     publish_presence(force=True)
@@ -876,9 +455,6 @@ def shutdown(signum=None, frame=None):
 
     sensor.when_pressed = None
     sensor.when_released = None
-
-    if tracking is not None:
-        tracking.stop()
 
     if client.is_connected():
 
@@ -924,9 +500,6 @@ def main():
     )
 
     client.loop_start()
-
-    if tracking is not None:
-        tracking.start()
 
     try:
         while True:

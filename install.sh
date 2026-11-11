@@ -5,7 +5,6 @@ APP_DIR=/opt/touchkio-mmwave-sensor
 SERVICE_NAME=touchkio-mmwave
 RAW_URL=https://raw.githubusercontent.com/Lela810/touchkio-mmwave-sensor/main
 UPDATE_COMMAND=/usr/local/bin/touchkio-mmwave-update
-CONFIG_FILE=/etc/default/touchkio-mmwave
 
 if [[ ${EUID} -ne 0 ]]; then
     echo "Run this installer with sudo." >&2
@@ -69,8 +68,6 @@ if ! getent group gpio >/dev/null; then
     exit 1
 fi
 usermod -aG gpio "$SERVICE_USER"
-# dialout grants access to the serial port used for detailed tracking.
-usermod -aG dialout "$SERVICE_USER"
 
 install -d -o root -g root -m 0755 "$APP_DIR"
 install -o root -g root -m 0644 "$SOURCE_DIR/mmwave.py" "$APP_DIR/mmwave.py"
@@ -84,57 +81,8 @@ sed "s/@SERVICE_USER@/$SERVICE_USER/g" \
     >"/etc/systemd/system/$SERVICE_NAME.service"
 chmod 0644 "/etc/systemd/system/$SERVICE_NAME.service"
 
-# Keep existing settings so updates do not reset them.
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    cat >"$CONFIG_FILE" <<'EOF'
-# Settings for the TouchKio mmWave sensor service.
-# Restart the service after changing them:
-#   sudo systemctl restart touchkio-mmwave
-
-# Publish detailed tracking data (target count, distance, speed, energy)
-# read from the C4001 over UART. Switches the sensor to speed and distance
-# mode while the service runs. Set to 0 to only publish the OUT pin.
-C4001_TRACKING=1
-
-# Serial port connected to the C4001 TX/RX pins. "auto" uses /dev/ttyAMA0
-# on a Raspberry Pi 5 and /dev/serial0 on other models.
-C4001_SERIAL_PORT=auto
-C4001_SERIAL_BAUD=9600
-
-# Minimum seconds between tracking updates sent to MQTT.
-C4001_TRACKING_INTERVAL=0.5
-EOF
-    chmod 0644 "$CONFIG_FILE"
-elif grep -q '^# mode while the service runs. Set to 1 to enable.$' "$CONFIG_FILE"; then
-    # Move settings written by older installers to the new defaults unless
-    # they were changed.
-    sed -i \
-        -e 's/^# mode while the service runs. Set to 1 to enable.$/# mode while the service runs. Set to 0 to only publish the OUT pin./' \
-        -e 's/^C4001_TRACKING=0$/C4001_TRACKING=1/' \
-        -e 's|^# Serial port connected to the C4001 TX/RX pins.$|# Serial port connected to the C4001 TX/RX pins. "auto" uses /dev/ttyAMA0\n# on a Raspberry Pi 5 and /dev/serial0 on other models.|' \
-        -e 's|^C4001_SERIAL_PORT=/dev/serial0$|C4001_SERIAL_PORT=auto|' \
-        "$CONFIG_FILE"
-fi
-
-# Enable the UART on GPIO 14/15 when tracking is on.
-REBOOT_REQUIRED=0
-if grep -Eq '^C4001_TRACKING=(1|true|yes|on)$' "$CONFIG_FILE"; then
-    BOOT_CONFIG=/boot/firmware/config.txt
-    [[ -f "$BOOT_CONFIG" ]] || BOOT_CONFIG=/boot/config.txt
-    MODEL=$(tr -d '\0' </proc/device-tree/model 2>/dev/null || true)
-    if [[ "$MODEL" == *"Raspberry Pi 5"* || "$MODEL" == *"Compute Module 5"* ]]; then
-        if [[ -f "$BOOT_CONFIG" ]] && ! grep -q '^dtparam=uart0=on' "$BOOT_CONFIG"; then
-            echo 'dtparam=uart0=on' >>"$BOOT_CONFIG"
-            REBOOT_REQUIRED=1
-        fi
-    elif command -v raspi-config >/dev/null 2>&1; then
-        if [[ -f "$BOOT_CONFIG" ]] && ! grep -q '^enable_uart=1' "$BOOT_CONFIG"; then
-            REBOOT_REQUIRED=1
-        fi
-        raspi-config nonint do_serial_cons 1
-        raspi-config nonint do_serial_hw 0
-    fi
-fi
+# Settings file from earlier versions with detailed tracking.
+rm -f /etc/default/touchkio-mmwave
 
 cat >"$UPDATE_COMMAND" <<EOF
 #!/usr/bin/env bash
@@ -157,10 +105,4 @@ chmod 0755 "$UPDATE_COMMAND"
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME.service"
 systemctl restart "$SERVICE_NAME.service"
-systemctl --no-pager --full status "$SERVICE_NAME.service" || true
-
-if [[ $REBOOT_REQUIRED -eq 1 ]]; then
-    echo
-    echo "The serial port for detailed tracking was enabled. Reboot to apply it:"
-    echo "  sudo reboot"
-fi
+systemctl --no-pager --full status "$SERVICE_NAME.service"

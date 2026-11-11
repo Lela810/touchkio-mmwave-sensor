@@ -1,4 +1,3 @@
 cryptography
 gpiozero
 paho-mqtt
-pyserial
