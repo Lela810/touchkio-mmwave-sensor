@@ -6,7 +6,8 @@ After=network-online.target
 [Service]
 Type=simple
 User=@SERVICE_USER@
-SupplementaryGroups=gpio
+SupplementaryGroups=gpio dialout
+EnvironmentFile=-/etc/default/touchkio-mmwave
 WorkingDirectory=/opt/touchkio-mmwave-sensor
 ExecStart=/opt/touchkio-mmwave-sensor/venv/bin/python /opt/touchkio-mmwave-sensor/mmwave.py
 Restart=on-failure

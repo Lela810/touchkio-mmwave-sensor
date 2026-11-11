@@ -4,13 +4,16 @@ set -euo pipefail
 APP_DIR=/opt/touchkio-mmwave-sensor
 SERVICE_NAME=touchkio-mmwave
 RAW_URL=https://raw.githubusercontent.com/Lela810/touchkio-mmwave-sensor/main
+UPDATE_COMMAND=/usr/local/bin/touchkio-mmwave-update
+CONFIG_FILE=/etc/default/touchkio-mmwave
 
 if [[ ${EUID} -ne 0 ]]; then
     echo "Run this installer with sudo." >&2
     exit 1
 fi
 
-SERVICE_USER=${SUDO_USER:-}
+# TOUCHKIO_USER is set by the update command to keep the existing service user.
+SERVICE_USER=${TOUCHKIO_USER:-${SUDO_USER:-}}
 if [[ -z "$SERVICE_USER" || "$SERVICE_USER" == root ]]; then
     echo "Run this installer with sudo from the account that runs TouchKio." >&2
     exit 1
@@ -35,8 +38,13 @@ if ! command -v apt-get >/dev/null 2>&1; then
     exit 1
 fi
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-if [[ -f "$SCRIPT_DIR/mmwave.py" \
+# BASH_SOURCE is empty when the installer is piped into bash.
+SCRIPT_DIR=
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+fi
+if [[ -n "$SCRIPT_DIR" \
+    && -f "$SCRIPT_DIR/mmwave.py" \
     && -f "$SCRIPT_DIR/requirements.txt" \
     && -f "$SCRIPT_DIR/touchkio-mmwave.service" ]]; then
     SOURCE_DIR=$SCRIPT_DIR
@@ -61,6 +69,8 @@ if ! getent group gpio >/dev/null; then
     exit 1
 fi
 usermod -aG gpio "$SERVICE_USER"
+# dialout grants access to the serial port used for detailed tracking.
+usermod -aG dialout "$SERVICE_USER"
 
 install -d -o root -g root -m 0755 "$APP_DIR"
 install -o root -g root -m 0644 "$SOURCE_DIR/mmwave.py" "$APP_DIR/mmwave.py"
@@ -74,6 +84,47 @@ sed "s/@SERVICE_USER@/$SERVICE_USER/g" \
     >"/etc/systemd/system/$SERVICE_NAME.service"
 chmod 0644 "/etc/systemd/system/$SERVICE_NAME.service"
 
+# Keep existing settings so updates do not reset them.
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat >"$CONFIG_FILE" <<'EOF'
+# Settings for the TouchKio mmWave sensor service.
+# Restart the service after changing them:
+#   sudo systemctl restart touchkio-mmwave
+
+# Publish detailed tracking data (target count, distance, speed, energy)
+# read from the C4001 over UART. Switches the sensor to speed and distance
+# mode while the service runs. Set to 1 to enable.
+C4001_TRACKING=0
+
+# Serial port connected to the C4001 TX/RX pins.
+C4001_SERIAL_PORT=/dev/serial0
+C4001_SERIAL_BAUD=9600
+
+# Minimum seconds between tracking updates sent to MQTT.
+C4001_TRACKING_INTERVAL=0.5
+EOF
+    chmod 0644 "$CONFIG_FILE"
+fi
+
+cat >"$UPDATE_COMMAND" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ \${EUID} -ne 0 ]]; then
+    exec sudo "\$0" "\$@"
+fi
+
+TOUCHKIO_USER=\$(systemctl show --property=User --value $SERVICE_NAME.service)
+if [[ -z "\$TOUCHKIO_USER" || "\$TOUCHKIO_USER" == root ]]; then
+    echo "Could not determine the TouchKio user from $SERVICE_NAME.service." >&2
+    exit 1
+fi
+
+curl -fsSL $RAW_URL/install.sh | TOUCHKIO_USER="\$TOUCHKIO_USER" bash
+EOF
+chmod 0755 "$UPDATE_COMMAND"
+
 systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME.service"
+systemctl enable "$SERVICE_NAME.service"
+systemctl restart "$SERVICE_NAME.service"
 systemctl --no-pager --full status "$SERVICE_NAME.service"
