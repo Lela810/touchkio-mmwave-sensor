@@ -1,18 +1,44 @@
 
 #!/usr/bin/env python3
 
+import atexit
 import base64
 import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+
+
+def ensure_writable_workdir():
+
+    # lgpio creates notification pipes in its working directory (LG_WD or
+    # the current directory). Without write access there, gpiozero cannot
+    # load any pin factory, so switch to a writable directory first.
+    if os.access(os.getcwd(), os.W_OK) and os.access(
+        os.environ.get("LG_WD", "."), os.W_OK
+    ):
+        return
+
+    workdir = os.environ.get("RUNTIME_DIRECTORY", "").split(":")[0]
+
+    if not workdir or not os.access(workdir, os.W_OK):
+        workdir = tempfile.mkdtemp(prefix="touchkio-mmwave-")
+        atexit.register(shutil.rmtree, workdir, ignore_errors=True)
+
+    os.chdir(workdir)
+    os.environ["LG_WD"] = workdir
+
+
+ensure_writable_workdir()
 
 import paho.mqtt.client as mqtt
 from gpiozero import Button
